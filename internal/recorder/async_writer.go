@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"recording-server/internal/index"
+	"recording-server/internal/memory"
+	"recording-server/internal/metrics"
 	"recording-server/internal/storage"
 )
 
@@ -25,6 +27,7 @@ type AsyncWriter struct {
 	index    index.IndexStore
 	queue    chan *WriteJob
 	strategy BackpressureStrategy
+	memCtrl  *memory.Controller
 
 	mu     sync.RWMutex
 	closed bool
@@ -61,16 +64,36 @@ func NewAsyncWriterWithStrategy(store storage.StorageBackend, idx index.IndexSto
 	return w
 }
 
+// SetMemoryController attaches a memory controller for tracking write buffer allocations.
+func (w *AsyncWriter) SetMemoryController(mc *memory.Controller) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.memCtrl = mc
+}
+
 func (w *AsyncWriter) Submit(job *WriteJob) error {
 	w.mu.RLock()
 	closed := w.closed
 	strategy := w.strategy
+	memCtrl := w.memCtrl
 	w.mu.RUnlock()
 	if closed {
 		return fmt.Errorf("writer closed")
 	}
 
+	// Track memory allocation for the job data
+	jobSize := int64(len(job.GOPData) + len(job.InitData))
+	if memCtrl != nil {
+		if err := memCtrl.Allocate(jobSize); err != nil {
+			atomic.AddUint64(&w.dropped, 1)
+			metrics.WriterDropped.Inc()
+			log.Printf("[%s] memory limit, dropping job (%d bytes)", job.CameraID, jobSize)
+			return err
+		}
+	}
+
 	atomic.AddUint64(&w.submitted, 1)
+	metrics.WriterQueueDepth.Set(float64(len(w.queue) + 1))
 
 	switch strategy {
 	case BackpressureBlock:
@@ -151,6 +174,13 @@ func (w *AsyncWriter) worker() {
 				log.Printf("[%s] failed to process job: %v", j.CameraID, err)
 			}
 		}
+		// Release memory and update metrics for processed jobs
+		for _, j := range batch {
+			if w.memCtrl != nil {
+				w.memCtrl.Release(int64(len(j.GOPData) + len(j.InitData)))
+			}
+		}
+		metrics.WriterQueueDepth.Set(float64(len(w.queue)))
 		batch = batch[:0]
 	}
 }
@@ -177,6 +207,7 @@ func (w *AsyncWriter) processBatch(jobs []*WriteJob) error {
 	defer cancel()
 
 	for _, job := range jobs {
+		start := time.Now()
 		if len(job.InitData) > 0 && job.Meta.InitKey != "" {
 			if err := w.storage.Put(ctx, job.Meta.InitKey, job.InitData); err != nil && err != storage.ErrEntryPendingCompensation {
 				return fmt.Errorf("put init: %w", err)
@@ -185,6 +216,8 @@ func (w *AsyncWriter) processBatch(jobs []*WriteJob) error {
 		if err := w.storage.Put(ctx, job.Meta.ObjectKey, job.GOPData); err != nil && err != storage.ErrEntryPendingCompensation {
 			return fmt.Errorf("put gop: %w", err)
 		}
+		metrics.StorageWriteLatency.Observe(time.Since(start).Seconds())
+		metrics.GOPsWritten.WithLabelValues(job.CameraID).Inc()
 	}
 
 	items := make([]struct {

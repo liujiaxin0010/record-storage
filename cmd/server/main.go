@@ -8,12 +8,15 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"recording-server/internal/api"
 	"recording-server/internal/config"
 	"recording-server/internal/index"
+	"recording-server/internal/memory"
+	"recording-server/internal/metrics"
 	"recording-server/internal/playback"
 	"recording-server/internal/puller"
 	"recording-server/internal/recorder"
@@ -46,6 +49,9 @@ func main() {
 		log.Fatalf("create data dir: %v", err)
 	}
 
+	// Initialize memory controller
+	memCtrl := memory.NewController(cfg.Memory.MaxMemoryMB)
+
 	var store storage.StorageBackend
 	if cfg.Storage.SeaweedFS.Mode == "hybrid" {
 		store, err = storage.NewSeaweedHybridStorage(cfg.Storage.SeaweedFS)
@@ -63,7 +69,13 @@ func main() {
 	}
 	defer idx.Close()
 
+	// Start index snapshot manager
+	snapshotMgr := index.NewSnapshotManager(idx.DB(), store, cfg.Index.SnapshotInterval)
+	snapshotMgr.Start()
+	defer snapshotMgr.Stop()
+
 	writer := recorder.NewAsyncWriter(store, idx, cfg.Recorder.AsyncWriterWorkers, cfg.Recorder.AsyncWriterQueueSize)
+	writer.SetMemoryController(memCtrl)
 	defer writer.Close()
 
 	playbackServer := playback.NewServer(cfg.Server.RTSPPlaybackPort, store, idx)
@@ -74,11 +86,14 @@ func main() {
 
 	recorders := make(map[string]*recorder.StreamRecorder)
 	var pullers []*puller.RTSPPuller
+	cameraIDs := make([]string, 0, len(cfg.Cameras))
 	for _, camera := range cfg.Cameras {
 		if !camera.Enabled {
 			continue
 		}
+		cameraIDs = append(cameraIDs, camera.ID)
 		streamRecorder := recorder.NewStreamRecorder(camera.ID, writer)
+		streamRecorder.SetMemoryController(memCtrl)
 		recorders[camera.ID] = streamRecorder
 		if camera.Recording.AutoStart && len(camera.Recording.Schedule) == 0 {
 			streamRecorder.Start()
@@ -102,16 +117,35 @@ func main() {
 	scheduleController.Start()
 	defer scheduleController.Stop()
 
+	// Start retention cleaner
+	retentionCleaner := recorder.NewRetentionCleaner(store, idx, cfg.Recorder.RetentionDays, cameraIDs)
+	retentionCleaner.Start()
+	defer retentionCleaner.Stop()
+
+	// Start Prometheus metrics server
 	go http.ListenAndServe(":9090", promhttp.Handler())
 
-	apiServer := api.NewServer(8080, idx, writer, recorders)
+	// Start periodic memory metrics updater
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			memCtrl.UpdateMetrics()
+			metrics.MemoryUsageBytes.Set(float64(memCtrl.Used()))
+			metrics.MemoryPressureLevel.Set(float64(memCtrl.GetPressureLevel()))
+		}
+	}()
+
+	apiServer := api.NewServer(cfg.Server.APIPort, idx, writer, recorders)
+	apiServer.SetMemoryController(memCtrl)
 	if err := apiServer.Start(); err != nil {
 		log.Printf("warning: failed to start API server: %v", err)
 	}
 	defer apiServer.Close()
 
 	log.Printf("server ready: %d active camera(s), playback on rtsp://0.0.0.0:%d/playback/{camera_id}?start=RFC3339", len(pullers), cfg.Server.RTSPPlaybackPort)
-	log.Printf("metrics: http://0.0.0.0:9090/metrics, api: http://0.0.0.0:8080/api/v1/")
+	log.Printf("metrics: http://0.0.0.0:9090/metrics, api: http://0.0.0.0:%d/api/v1/", cfg.Server.APIPort)
+	log.Printf("retention: %d days, index snapshot: every %ds", cfg.Recorder.RetentionDays, cfg.Index.SnapshotInterval)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -121,7 +155,9 @@ func main() {
 	for _, item := range pullers {
 		item.Stop()
 	}
+	retentionCleaner.Stop()
 	scheduleController.Stop()
+	snapshotMgr.Stop()
 	playbackServer.Close()
 	writer.Close()
 	idx.Close()
