@@ -1,0 +1,23 @@
+# binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# build output
+/bin/
+/data/
+*.out
+
+# editor / env
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# local config
+config.local.yaml
+
+# local AI tooling
+/.claude/

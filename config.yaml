@@ -1,0 +1,36 @@
+server:
+  rtsp_playback_port: 8554
+  api_port: 8080
+  metrics_port: 9090
+
+memory:
+  max_memory_mb: 4096
+  gop_buffer_pool_size: 2097152
+
+storage:
+  seaweedfs:
+    mode: "filer_http"
+    filer_http_url: "http://localhost:8888"
+    master_grpc_addrs: []
+    filer_grpc_addrs: []
+
+index:
+  bolt_path: "./data/recordings.db"
+  batch_interval_ms: 100
+  snapshot_interval: 300
+
+recorder:
+  segment_mode: "gop"
+  async_writer_workers: 8
+  async_writer_queue_size: 1000
+  retry_max: 3
+  retention_days: 30
+
+cameras:
+  - id: "cam01"
+    rtsp_url: "rtsp://admin:password@192.168.1.64:554/stream"
+    transport: "tcp"
+    enabled: true
+    recording:
+      auto_start: true
+      schedule: []
