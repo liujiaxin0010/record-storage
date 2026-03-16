@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"recording-server/internal/config"
+	"recording-server/internal/metrics"
 )
 
 const (
@@ -79,20 +80,30 @@ func newSeaweedHybridStorageWithClients(master MasterClient, filer FilerClient, 
 
 func (s *SeaweedHybridStorage) Put(ctx context.Context, key string, data []byte) error {
 	if s.shouldUseFallback() {
+		metrics.SeaweedHybridFallbackTotal.Inc()
 		return s.fallback.Put(ctx, key, data)
 	}
+
+	// Assign with metrics
+	assignStart := time.Now()
 	assign, err := retryValue(ctx, seaweedRetryAttempts, func() (AssignResult, error) {
 		return s.master.Assign(ctx, AssignParams{Count: 1})
 	})
+	metrics.SeaweedAssignLatency.Observe(time.Since(assignStart).Seconds())
 	if err != nil {
 		s.recordControlFailure()
 		return s.tryFallbackPut(ctx, key, data, err)
 	}
+
+	// Volume PUT with metrics
+	putStart := time.Now()
 	if err := retryDo(ctx, seaweedRetryAttempts, func() error {
 		return s.volume.Put(withTimeout(ctx, 2*time.Second), assign.VolumeURL, assign.FID, data, assign.AuthToken)
 	}); err != nil {
 		return err
 	}
+	metrics.SeaweedVolumePutLatency.Observe(time.Since(putStart).Seconds())
+
 	now := time.Now().UnixNano()
 	meta := EntryMeta{
 		Key:        key,
@@ -104,13 +115,19 @@ func (s *SeaweedHybridStorage) Put(ctx context.Context, key string, data []byte)
 		ModifiedAt: now,
 		ETag:       fmt.Sprintf("%x", md5.Sum(data)),
 	}
+
+	// CreateEntry with metrics
+	ceStart := time.Now()
 	if err := retryDo(ctx, seaweedRetryAttempts, func() error {
 		return s.filer.CreateEntry(withTimeout(ctx, 300*time.Millisecond), meta)
 	}); err != nil {
+		metrics.SeaweedCreateEntryLatency.Observe(time.Since(ceStart).Seconds())
 		s.recordControlFailure()
 		s.enqueueCompensation(meta)
 		return ErrEntryPendingCompensation
 	}
+	metrics.SeaweedCreateEntryLatency.Observe(time.Since(ceStart).Seconds())
+
 	s.clearControlFailures()
 	s.setEntryCache(meta)
 	s.setVolumeCache(assign.VolumeID, []VolumeLocation{{URL: assign.VolumeURL, AuthToken: assign.AuthToken}})
@@ -145,9 +162,11 @@ func (s *SeaweedHybridStorage) GetRange(ctx context.Context, key string, offset,
 	if err != nil {
 		return nil, err
 	}
+	start := time.Now()
 	data, err := retryValue(ctx, seaweedRetryAttempts, func() ([]byte, error) {
 		return s.volume.GetRange(withTimeout(ctx, 2*time.Second), locations[0].URL, meta.FileID, offset, length)
 	})
+	metrics.SeaweedVolumeGetRangeLatency.Observe(time.Since(start).Seconds())
 	if errors.Is(err, ErrNotFound) {
 		s.deleteVolumeCache(meta.VolumeID)
 		if locations, err = s.getVolumeLocationsFresh(ctx, meta.VolumeID); err == nil && len(locations) > 0 {
@@ -343,6 +362,7 @@ func (s *SeaweedHybridStorage) enqueueCompensation(meta EntryMeta) {
 		return
 	}
 	s.compPending[meta.Key] = meta
+	metrics.SeaweedCompensationQueueSize.Set(float64(len(s.compPending)))
 	select {
 	case s.compQueue <- meta:
 	default:
@@ -366,15 +386,19 @@ func (s *SeaweedHybridStorage) runCompensationLoop() {
 
 func (s *SeaweedHybridStorage) retryCreateEntry(meta EntryMeta) {
 	for attempt := 0; attempt < 3; attempt++ {
+		metrics.SeaweedCompensationRetryTotal.Inc()
 		if err := s.filer.CreateEntry(withTimeout(context.Background(), 300*time.Millisecond), meta); err == nil {
 			s.compMu.Lock()
 			delete(s.compPending, meta.Key)
+			metrics.SeaweedCompensationQueueSize.Set(float64(len(s.compPending)))
 			s.compMu.Unlock()
 			s.setEntryCache(meta)
 			return
 		}
 		time.Sleep(time.Duration(50*(1<<attempt)) * time.Millisecond)
 	}
+	// Exceeded retries - mark as suspected orphan
+	metrics.SeaweedOrphanSuspectedTotal.Inc()
 }
 
 func (s *SeaweedHybridStorage) cachedEntry(key string) (EntryMeta, bool) {

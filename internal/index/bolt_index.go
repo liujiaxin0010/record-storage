@@ -169,6 +169,72 @@ func (b *BoltIndex) GetRecordingRanges(ctx context.Context, cameraID string, dat
 	return ranges, nil
 }
 
+// DeleteRange removes all GOPs for a camera within the specified time range.
+func (b *BoltIndex) DeleteRange(ctx context.Context, cameraID string, start, end time.Time) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		// Delete from V2 buckets
+		if b.useV2 {
+			root := tx.Bucket(gopBucketV2)
+			cameraBucket := root.Bucket([]byte(cameraID))
+			if cameraBucket != nil {
+				startDate := start.Truncate(24 * time.Hour)
+				endDate := end.Truncate(24 * time.Hour).Add(24 * time.Hour)
+
+				for d := startDate; !d.After(endDate); d = d.Add(24 * time.Hour) {
+					dateKey := []byte(d.Format("2006-01-02"))
+					dateBucket := cameraBucket.Bucket(dateKey)
+					if dateBucket == nil {
+						continue
+					}
+
+					startKey := makeBinaryKey(cameraID, start)
+					endKey := makeBinaryKey(cameraID, end)
+
+					c := dateBucket.Cursor()
+					var toDelete [][]byte
+					for k, _ := c.Seek(startKey); k != nil && string(k) <= string(endKey); k, _ = c.Next() {
+						keyCopy := make([]byte, len(k))
+						copy(keyCopy, k)
+						toDelete = append(toDelete, keyCopy)
+					}
+					for _, k := range toDelete {
+						if err := dateBucket.Delete(k); err != nil {
+							return err
+						}
+					}
+
+					// If date bucket is now empty, remove it
+					if dateBucket.Stats().KeyN == 0 {
+						_ = cameraBucket.DeleteBucket(dateKey)
+					}
+				}
+			}
+		}
+
+		// Delete from V1 bucket
+		bucket := tx.Bucket(gopBucket)
+		startKey := makeGOPKey(cameraID, start)
+		endKey := makeGOPKey(cameraID, end)
+		prefix := []byte(cameraID + ":")
+		c := bucket.Cursor()
+		var toDelete [][]byte
+		for k, _ := c.Seek(startKey); k != nil && string(k) <= string(endKey); k, _ = c.Next() {
+			if len(k) < len(prefix) || string(k[:len(prefix)]) != string(prefix) {
+				continue
+			}
+			keyCopy := make([]byte, len(k))
+			copy(keyCopy, k)
+			toDelete = append(toDelete, keyCopy)
+		}
+		for _, k := range toDelete {
+			if err := bucket.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (b *BoltIndex) Close() error {
 	return b.db.Close()
 }

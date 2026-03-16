@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"recording-server/internal/index"
+	"recording-server/internal/memory"
 	"recording-server/internal/storage"
 )
 
@@ -19,6 +20,7 @@ type StreamRecorder struct {
 	assembler *GOPAssembler
 	builder   *FMP4Builder
 	writer    *AsyncWriter
+	memCtrl   *memory.Controller
 
 	state    atomic.Value
 	initKey  string
@@ -37,6 +39,13 @@ func NewStreamRecorder(cameraID string, writer *AsyncWriter) *StreamRecorder {
 	}
 	s.state.Store(RecorderStateIdle)
 	return s
+}
+
+// SetMemoryController attaches a memory controller for backpressure-based frame dropping.
+func (s *StreamRecorder) SetMemoryController(mc *memory.Controller) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.memCtrl = mc
 }
 
 func (s *StreamRecorder) Start() {
@@ -84,6 +93,11 @@ func (s *StreamRecorder) ProcessSample(sample Sample) error {
 		return nil
 	}
 	if state == RecorderStateWaitingKeyFrame && !sample.IsKey {
+		return nil
+	}
+
+	// Memory backpressure: drop frames based on pressure level
+	if s.memCtrl != nil && !sample.IsKey && s.memCtrl.ShouldDropFrame(string(sample.FrameType)) {
 		return nil
 	}
 
